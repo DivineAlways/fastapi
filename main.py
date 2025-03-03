@@ -1,9 +1,8 @@
-# main.py
 import os
 import sys
 import json
 import time
-from typing import List
+from typing import List, Dict
 from fastapi import FastAPI, HTTPException
 from pydantic import BaseModel, Field
 from rich.console import Console
@@ -13,15 +12,15 @@ from openai import pydantic_function_tool
 from firecrawl import FirecrawlApp
 from dotenv import load_dotenv
 
-# Load environment variables (from .env file or platform settings)
+# Load environment variables
 load_dotenv()
 
-# Initialize rich console for logging (prints will show in logs)
+app = FastAPI()
 console = Console()
 
-# Ensure required API keys are set in the environment
 FIRECRAWL_API_KEY = os.getenv("FIRECRAWL_API_KEY")
 OPENAI_API_KEY = os.getenv("OPENAI_API_KEY")
+
 if not FIRECRAWL_API_KEY:
     console.print("[red]Error: FIRECRAWL_API_KEY not found in environment variables[/red]")
     sys.exit(1)
@@ -29,29 +28,37 @@ if not OPENAI_API_KEY:
     console.print("[red]Error: OPENAI_API_KEY not found in environment variables[/red]")
     sys.exit(1)
 
-# Initialize Firecrawl and OpenAI clients (this uses your working, older version)
+# Initialize Firecrawl and OpenAI clients
 firecrawl_app = FirecrawlApp(api_key=FIRECRAWL_API_KEY)
-client = openai.OpenAI()  # Using the version that worked for you
+client = openai.OpenAI()
 
-# --- Define Pydantic Models for Function Tools ---
+##############################################################################
+# In-memory "file system" dictionary
+# Key = file_path (e.g., "scraped_content.md")
+# Value = file content (string)
+##############################################################################
+files_in_memory: Dict[str, str] = {}
+
+##############################################################################
+# Define Tools via Pydantic
+##############################################################################
 class ScrapeUrlArgs(BaseModel):
     reasoning: str = Field(..., description="Explanation for why we're scraping this URL")
     url: str = Field(..., description="The URL to scrape")
-    output_file_path: str = Field(..., description="Path to save the scraped content")
+    output_file_path: str = Field(..., description="Path to save the scraped content (in memory)")
 
 class ReadLocalFileArgs(BaseModel):
     reasoning: str = Field(..., description="Explanation for why we're reading this file")
-    file_path: str = Field(..., description="Path of the file to read")
+    file_path: str = Field(..., description="Path (key) of the file to read (in memory)")
 
 class UpdateLocalFileArgs(BaseModel):
     reasoning: str = Field(..., description="Explanation for why we're updating this file")
-    file_path: str = Field(..., description="Path of the file to update")
-    content: str = Field(..., description="New content to write to the file")
+    file_path: str = Field(..., description="Path (key) of the file to update (in memory)")
+    content: str = Field(..., description="New content to write")
 
 class CompleteTaskArgs(BaseModel):
     reasoning: str = Field(..., description="Explanation of why the task is complete")
 
-# Create the tools list from our pydantic models
 tools = [
     pydantic_function_tool(ScrapeUrlArgs),
     pydantic_function_tool(ReadLocalFileArgs),
@@ -59,7 +66,9 @@ tools = [
     pydantic_function_tool(CompleteTaskArgs),
 ]
 
-# --- Agent Prompt Template ---
+##############################################################################
+# Agent Prompt Template
+##############################################################################
 AGENT_PROMPT = """<purpose>
     You are a world-class web scraping and content filtering expert.
     Your goal is to scrape web content and filter it according to the user's needs.
@@ -169,7 +178,9 @@ AGENT_PROMPT = """<purpose>
 </output-file-path>
 """
 
-# --- Logging Functions (using rich) ---
+##############################################################################
+# Logging Helpers
+##############################################################################
 def log_function_call(function_name: str, function_args: dict):
     args_str = ", ".join(f"{k}={repr(v)}" for k, v in function_args.items())
     console.print(Panel(f"{function_name}({args_str})", title="[blue]Function Call[/blue]", border_style="blue"))
@@ -180,15 +191,17 @@ def log_function_result(function_name: str, result: str):
 def log_error(error_msg: str):
     console.print(Panel(str(error_msg), title="[red]Error[/red]", border_style="red"))
 
-# --- Tool Implementations ---
+##############################################################################
+# Tool Implementations (In-Memory)
+##############################################################################
 def scrape_url(reasoning: str, url: str, output_file_path: str) -> str:
+    """Scrapes content from a URL and saves it in memory."""
     log_function_call("scrape_url", {"reasoning": reasoning, "url": url, "output_file_path": output_file_path})
     try:
         response = firecrawl_app.scrape_url(url=url, params={"formats": ["markdown"]})
-        if response.get("markdown"):
+        if "markdown" in response:
             content = response["markdown"]
-            with open(output_file_path, "w") as f:
-                f.write(content)
+            files_in_memory[output_file_path] = content  # store in memory
             log_function_result("scrape_url", f"Successfully scraped {len(content)} characters")
             return content
         else:
@@ -200,37 +213,33 @@ def scrape_url(reasoning: str, url: str, output_file_path: str) -> str:
         return ""
 
 def read_local_file(reasoning: str, file_path: str) -> str:
+    """Reads content from the in-memory 'file'."""
     log_function_call("read_local_file", {"reasoning": reasoning, "file_path": file_path})
-    try:
-        console.log(f"[blue]Reading File[/blue] - File: {file_path} - Reasoning: {reasoning}")
-        with open(file_path, "r") as f:
-            return f.read()
-    except Exception as e:
-        console.log(f"[red]Error reading file: {str(e)}[/red]")
-        return ""
+    content = files_in_memory.get(file_path, "")
+    log_function_result("read_local_file", f"Read {len(content)} characters")
+    return content
 
 def update_local_file(reasoning: str, file_path: str, content: str) -> str:
-    log_function_call("update_local_file", {"reasoning": reasoning, "file_path": file_path, "content": f"{len(content)} characters"})
-    try:
-        console.log(f"[blue]Updating File[/blue] - File: {file_path} - Reasoning: {reasoning}")
-        with open(file_path, "w") as f:
-            f.write(content)
-        log_function_result("update_local_file", f"Successfully wrote {len(content)} characters")
-        return "File updated successfully"
-    except Exception as e:
-        console.log(f"[red]Error updating file: {str(e)}[/red]")
-        return f"Error: {str(e)}"
+    """Updates in-memory 'file' with new content."""
+    log_function_call("update_local_file", {"reasoning": reasoning, "file_path": file_path, "content_length": len(content)})
+    files_in_memory[file_path] = content
+    log_function_result("update_local_file", f"Updated file with {len(content)} characters")
+    return "File updated successfully"
 
 def complete_task(reasoning: str) -> str:
+    """Signals that the task is complete."""
     log_function_call("complete_task", {"reasoning": reasoning})
-    console.log(f"[green]Task Complete[/green] - Reasoning: {reasoning}")
     result = "Task completed successfully"
     log_function_result("complete_task", result)
     return result
 
-# --- Agent Runner Function ---
+##############################################################################
+# Agent Runner (Same logic, but returns final in-memory files)
+##############################################################################
 def run_agent(url: str, prompt: str, output_file_path: str, compute_limit: int):
-    # Format the prompt with the provided values
+    # Clear in-memory dictionary each time we run
+    files_in_memory.clear()
+
     formatted_prompt = (
         AGENT_PROMPT.replace("{{user_prompt}}", prompt)
                     .replace("{{url}}", url)
@@ -240,9 +249,7 @@ def run_agent(url: str, prompt: str, output_file_path: str, compute_limit: int):
     iterations = 0
     break_loop = False
 
-    while iterations < compute_limit:
-        if break_loop:
-            break
+    while iterations < compute_limit and not break_loop:
         iterations += 1
         console.rule(f"[yellow]Agent Loop {iterations}/{compute_limit}[/yellow]")
         try:
@@ -257,6 +264,7 @@ def run_agent(url: str, prompt: str, output_file_path: str, compute_limit: int):
             if assistant_content:
                 console.print(Panel(assistant_content, title="Assistant"))
             messages.append({"role": "assistant", "content": assistant_content})
+
             if response_message.tool_calls:
                 messages.append({
                     "role": "assistant",
@@ -297,7 +305,8 @@ def run_agent(url: str, prompt: str, output_file_path: str, compute_limit: int):
                     except Exception as e:
                         error_msg = f"Error executing {function_name}: {str(e)}"
                         console.print(Panel(error_msg, title="[red]Error[/red]"))
-                        result = f"Error executing {function_name}({function_args}): {str(e)}"
+                        result = error_msg
+
                     messages.append({
                         "role": "tool",
                         "tool_call_id": tool_call.id,
@@ -306,18 +315,20 @@ def run_agent(url: str, prompt: str, output_file_path: str, compute_limit: int):
                     })
             else:
                 raise ValueError("No tool calls found - should not happen")
+
         except Exception as e:
             log_error(f"Error: {str(e)}")
-            console.print("[yellow]Messages at error:[/yellow]")
-    if iterations >= compute_limit:
-        log_error("Reached maximum number of iterations")
-        raise Exception("Reached maximum number of iterations")
-    return messages
+            break
 
-# --- FastAPI Setup ---
-app = FastAPI()
+    # Return final messages + any "files" we stored in memory
+    return {
+        "messages": messages,
+        "files_in_memory": files_in_memory
+    }
 
-# Define a Pydantic model for the API request
+##############################################################################
+# FastAPI Endpoint
+##############################################################################
 class AgentRequest(BaseModel):
     url: str
     prompt: str
@@ -327,7 +338,17 @@ class AgentRequest(BaseModel):
 @app.post("/run-agent")
 def run_agent_endpoint(request: AgentRequest):
     try:
-        messages = run_agent(request.url, request.prompt, request.output_file_path, request.compute_limit)
-        return {"messages": messages}
+        result = run_agent(
+            url=request.url,
+            prompt=request.prompt,
+            output_file_path=request.output_file_path,
+            compute_limit=request.compute_limit
+        )
+        return result
     except Exception as e:
         raise HTTPException(status_code=500, detail=str(e))
+
+# Optional root endpoint
+@app.get("/")
+def read_root():
+    return {"message": "Hello from the Firecrawl in-memory agent on Vercel!"}
